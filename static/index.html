@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Голосування</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; margin: 0; padding: 15px; }
+    .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); width: 100%; max-width: 420px; text-align: center; }
+    h2 { margin-top: 0; color: #1a1a1a; }
+    .poll-title { font-size: 1.25rem; font-weight: 600; color: #0056b3; margin: 20px 0; min-height: 40px; }
+    input[type="number"] { width: 100%; padding: 14px; font-size: 1.1rem; border: 2px solid #ddd; border-radius: 8px; box-sizing: border-box; text-align: center; margin-bottom: 20px; outline: none; }
+    input[type="number"]:focus { border-color: #0056b3; }
+    .btn-group { display: flex; flex-direction: column; gap: 12px; }
+    button.vote-btn { padding: 14px; font-size: 1.05rem; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; color: white; transition: 0.2s; }
+    button.vote-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-yes { background: #28a745; }
+    .btn-no { background: #dc3545; }
+    .btn-abstain { background: #6c757d; }
+    .msg { margin-top: 20px; font-weight: bold; padding: 10px; border-radius: 6px; }
+    .msg.success { background: #d4edda; color: #155724; }
+    .msg.error { background: #f8d7da; color: #721c24; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Електронне голосування</h2>
+    <div id="noPoll" style="color: #777;">Зараз немає активного голосування. Очікуйте...</div>
+
+    <div id="pollArea" style="display: none;">
+      <div class="poll-title" id="pollQuestion">Завантаження...</div>
+      <input type="number" id="voterNumber" placeholder="Введіть ваш порядковий номер" required min="1">
+      <div class="btn-group">
+        <button class="vote-btn btn-yes" onclick="sendVote('За')">👍 ЗА</button>
+        <button class="vote-btn btn-no" onclick="sendVote('Проти')">👎 ПРОТИ</button>
+        <button class="vote-btn btn-abstain" onclick="sendVote('Утримався')">✋ УТРИМАВСЯ</button>
+      </div>
+    </div>
+
+    <div id="feedback" class="msg" style="display: none;"></div>
+  </div>
+
+  <script>
+    let currentPollId = null;
+
+    async function loadActivePoll() {
+      try {
+        const res = await fetch('/api/poll/active');
+        const data = await res.json();
+        const noPoll = document.getElementById('noPoll');
+        const pollArea = document.getElementById('pollArea');
+
+        if (data.active) {
+          if (currentPollId !== data.poll.id) {
+            currentPollId = data.poll.id;
+            document.getElementById('pollQuestion').innerText = data.poll.title;
+            const input = document.getElementById('voterNumber');
+            input.disabled = false;
+            document.querySelectorAll('.vote-btn').forEach(b => b.disabled = false);
+            document.getElementById('feedback').style.display = 'none';
+          }
+          noPoll.style.display = 'none';
+          pollArea.style.display = 'block';
+        } else {
+          currentPollId = null;
+          noPoll.style.display = 'block';
+          pollArea.style.display = 'none';
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function sendVote(choice) {
+      const voterNumberInput = document.getElementById('voterNumber');
+      const voterNumber = voterNumberInput.value.trim();
+
+      if (!voterNumber) {
+        showMsg('Будь ласка, введіть свій порядковий номер!', 'error');
+        return;
+      }
+
+      const buttons = document.querySelectorAll('.vote-btn');
+      buttons.forEach(b => b.disabled = true);
+
+      try {
+        const res = await fetch('/api/vote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pollId: currentPollId, voterNumber: parseInt(voterNumber, 10), choice })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          showMsg(`Успіх! Ваш голос "${choice}" зараховано.`, 'success');
+          voterNumberInput.disabled = true;
+        } else {
+          showMsg(data.detail || 'Помилка голосування', 'error');
+          buttons.forEach(b => b.disabled = false);
+        }
+      } catch (err) {
+        showMsg('Мережева помилка. Спробуйте ще раз.', 'error');
+        buttons.forEach(b => b.disabled = false);
+      }
+    }
+
+    function showMsg(text, type) {
+      const fb = document.getElementById('feedback');
+      fb.innerText = text;
+      fb.className = `msg ${type}`;
+      fb.style.display = 'block';
+    }
+
+    function schedulePoll() {
+      const delay = 5000 + Math.random() * 4000;
+      setTimeout(async () => {
+        await loadActivePoll();
+        schedulePoll();
+      }, delay);
+    }
+
+    loadActivePoll();
+    schedulePoll();
+  </script>
+</body>
+</html>

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Адмін-панель</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8f9fa; margin: 0; padding: 20px; }
+    .container { max-width: 800px; margin: 0 auto; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); margin-bottom: 20px; }
+    input, textarea, button { font-size: 1rem; padding: 10px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box; }
+    button { cursor: pointer; background: #007bff; color: white; border: none; font-weight: bold; }
+    button.danger { background: #dc3545; }
+    .stats-box { display: flex; gap: 15px; margin: 15px 0; }
+    .stat-item { flex: 1; padding: 15px; border-radius: 6px; text-align: center; color: white; }
+    .stat-yes { background: #28a745; }
+    .stat-no { background: #dc3545; }
+    .stat-abstain { background: #6c757d; }
+    .stat-number { font-size: 2rem; font-weight: bold; }
+    table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+    th, td { border: 1px solid #eee; padding: 8px 12px; text-align: left; }
+    th { background: #f1f1f1; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h2>Панель адміністратора</h2>
+      <input type="password" id="adminPass" placeholder="Пароль адміністратора" style="width: 70%;">
+      <button onclick="loadStats()">Увійти / Оновити</button>
+    </div>
+
+    <div class="card">
+      <h3>Нове голосування</h3>
+      <textarea id="newQuestion" placeholder="Введіть питання голосування..." rows="2" style="width: 100%; margin-bottom: 10px;"></textarea>
+      <button onclick="createPoll()">Запустити голосування</button>
+      <button class="danger" onclick="closePoll()">Закрити поточне</button>
+    </div>
+
+    <div class="card" id="statsCard">
+      <h3 id="currentPollTitle">Поточне голосування: Відсутнє</h3>
+      <p id="pollStatus" style="font-weight: bold;"></p>
+      
+      <div class="stats-box">
+        <div class="stat-item stat-yes">
+          <div>ЗА</div>
+          <div class="stat-number" id="countYes">0</div>
+        </div>
+        <div class="stat-item stat-no">
+          <div>ПРОТИ</div>
+          <div class="stat-number" id="countNo">0</div>
+        </div>
+        <div class="stat-item stat-abstain">
+          <div>УТРИМАВСЯ</div>
+          <div class="stat-number" id="countAbstain">0</div>
+        </div>
+      </div>
+      <p>Всього проголосувало: <strong id="totalVotes">0</strong></p>
+
+      <h4>Хто як проголосував:</h4>
+      <table>
+        <thead>
+          <tr><th>Порядковий номер</th><th>Вибір</th></tr>
+        </thead>
+        <tbody id="votersTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    let activePollId = null;
+
+    function getHeaders() {
+      return {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + document.getElementById('adminPass').value
+      };
+    }
+
+    async function loadStats() {
+      try {
+        const res = await fetch('/api/admin/stats', { headers: getHeaders() });
+        if (!res.ok) return alert('Помилка авторизації або з’єднання');
+        const data = await res.json();
+
+        if (!data.poll) {
+          document.getElementById('currentPollTitle').innerText = 'Немає створених опитувань';
+          return;
+        }
+
+        activePollId = data.poll.id;
+        document.getElementById('currentPollTitle').innerText = data.poll.title;
+        document.getElementById('pollStatus').innerText = data.poll.isActive ? '🟢 Голосування триває' : '🔴 Голосування закрито';
+        document.getElementById('countYes').innerText = data.stats['За'] || 0;
+        document.getElementById('countNo').innerText = data.stats['Проти'] || 0;
+        document.getElementById('countAbstain').innerText = data.stats['Утримався'] || 0;
+        document.getElementById('totalVotes').innerText = data.totalVotes;
+
+        const table = document.getElementById('votersTable');
+        table.innerHTML = '';
+        data.votersList.forEach(v => {
+          table.innerHTML += `<tr><td>№ ${v.voterNumber}</td><td><b>${v.choice}</b></td></tr>`;
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function createPoll() {
+      const title = document.getElementById('newQuestion').value.trim();
+      if (!title) return alert('Введіть текст питання!');
+
+      const res = await fetch('/api/admin/polls', {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ title })
+      });
+      if (res.ok) {
+        document.getElementById('newQuestion').value = '';
+        alert('Голосування успішно розпочато!');
+        loadStats();
+      } else {
+        alert('Не вдалося створити голосування');
+      }
+    }
+
+    async function closePoll() {
+      if (!activePollId) return alert('Немає активного опитування');
+      const res = await fetch(`/api/admin/polls/${activePollId}/close`, {
+        method: 'POST',
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        alert('Голосування закрито!');
+        loadStats();
+      }
+    }
+
+    setInterval(() => {
+      if (document.getElementById('adminPass').value) loadStats();
+    }, 4000);
+  </script>
+</body>
+</html>
