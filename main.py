@@ -1,81 +1,94 @@
+import asyncio
 import json
+import logging
 import os
+import secrets
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
 import asyncpg
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Response, status
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 import uvicorn
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("voting")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin128")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or "admin128"
+ADMIN_PASSWORD_IS_DEFAULT = not os.getenv("ADMIN_PASSWORD")
+# disable / prefer / require / verify-ca / verify-full
+DB_SSL = os.getenv("DB_SSL", "require")
+# Пул створюється в КОЖНОМУ воркері: max_size × кількість воркерів має вміщатися в max_connections сервера
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+# Кеш активного опитування живе окремо в кожному процесі (gunicorn -w N, кілька інстансів Azure),
+# тому тримаємо його лише кілька секунд — інакше інші воркери віддають уже закрите опитування.
+ACTIVE_POLL_CACHE_TTL = float(os.getenv("ACTIVE_POLL_CACHE_TTL", "2"))
+
+STANDARD_CHOICES = ("За", "Проти", "Утримався")
+MAX_VOTER_NUMBER = 100_000
 
 db_pool = None
 
-# Кеш у пам'яті для уникнення навантаження на PostgreSQL
-cached_active_poll = None
+active_poll_cache = {"poll": None, "expires": 0.0, "generation": 0}
+active_poll_lock = asyncio.Lock()
 
 # Резервне збереження в пам'яті (якщо немає DATABASE_URL)
 mem_polls = []
 mem_votes = []
 
+SCHEMA_SQL = """
+    -- Серіалізуємо міграцію між воркерами, що стартують одночасно
+    SELECT pg_advisory_xact_lock(724501);
+
+    CREATE TABLE IF NOT EXISTS polls (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        poll_type TEXT NOT NULL DEFAULT 'standard',
+        options JSONB DEFAULT '[]'::jsonb,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL
+    );
+    ALTER TABLE polls ADD COLUMN IF NOT EXISTS poll_type TEXT NOT NULL DEFAULT 'standard';
+    ALTER TABLE polls ADD COLUMN IF NOT EXISTS options JSONB DEFAULT '[]'::jsonb;
+
+    CREATE TABLE IF NOT EXISTS votes (
+        id TEXT PRIMARY KEY,
+        poll_id TEXT NOT NULL REFERENCES polls(id),
+        voter_number INT NOT NULL,
+        choice TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        CONSTRAINT unique_voter_per_poll UNIQUE (poll_id, voter_number)
+    );
+
+    -- Активним може бути лише одне опитування: прибираємо можливі дублікати і фіксуємо це індексом
+    UPDATE polls SET is_active = FALSE
+    WHERE is_active AND id <> (SELECT id FROM polls WHERE is_active ORDER BY created_at DESC LIMIT 1);
+    CREATE UNIQUE INDEX IF NOT EXISTS one_active_poll ON polls ((is_active)) WHERE is_active;
+"""
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_pool, cached_active_poll
+    global db_pool
+    if ADMIN_PASSWORD_IS_DEFAULT:
+        logger.warning("ADMIN_PASSWORD не задано — використовується пароль за замовчуванням. Задайте його в налаштуваннях!")
     if DATABASE_URL:
-        try:
-            db_pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=4,
-                max_size=30,
-                ssl="require"
-            )
-            async with db_pool.acquire() as conn:
-                # Створюємо або оновлюємо таблиці під підтримку рейтингових опитувань
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS polls (
-                        id TEXT PRIMARY KEY,
-                        title TEXT NOT NULL,
-                        poll_type TEXT NOT NULL DEFAULT 'standard',
-                        options JSONB DEFAULT '[]'::jsonb,
-                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                        created_at TIMESTAMPTZ NOT NULL
-                    );
-                    ALTER TABLE polls ADD COLUMN IF NOT EXISTS poll_type TEXT NOT NULL DEFAULT 'standard';
-                    ALTER TABLE polls ADD COLUMN IF NOT EXISTS options JSONB DEFAULT '[]'::jsonb;
-
-                    CREATE TABLE IF NOT EXISTS votes (
-                        id TEXT PRIMARY KEY,
-                        poll_id TEXT NOT NULL REFERENCES polls(id),
-                        voter_number INT NOT NULL,
-                        choice TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL,
-                        CONSTRAINT unique_voter_per_poll UNIQUE (poll_id, voter_number)
-                    );
-                """)
-                
-                # Підтягуємо активне опитування в кеш при запуску
-                row = await conn.fetchrow("SELECT id, title, poll_type, options FROM polls WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 1")
-                if row:
-                    opts = json.loads(row["options"]) if isinstance(row["options"], str) else (row["options"] or [])
-                    cached_active_poll = {
-                        "id": row["id"],
-                        "title": row["title"],
-                        "pollType": row["poll_type"],
-                        "options": opts
-                    }
-            print("PostgreSQL успішно підключено та кеш ініціалізовано!")
-        except Exception as e:
-            print("Помилка підключення до PostgreSQL:", e)
+        # Без переходу в режим пам'яті при помилці: у кількох воркерах кожен мав би власні дані
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX, ssl=DB_SSL)
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(SCHEMA_SQL)
+        logger.info("PostgreSQL успішно підключено")
     else:
-        print("Працюємо в локальному режимі пам'яті.")
+        logger.warning("DATABASE_URL не задано — працюємо в локальному режимі пам'яті")
     yield
     if db_pool:
         await db_pool.close()
@@ -83,22 +96,133 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Voting App", lifespan=lifespan)
 
 class VoteRequest(BaseModel):
-    pollId: str
-    voterNumber: int
+    pollId: str = Field(min_length=1, max_length=64)
+    voterNumber: int = Field(ge=1, le=MAX_VOTER_NUMBER)
     choice: Optional[str] = None
     selectedOptions: Optional[List[str]] = None
 
 class CreatePollRequest(BaseModel):
-    title: str
+    title: str = Field(max_length=500)
     pollType: Literal["standard", "ranking"] = "standard"
-    options: Optional[List[str]] = []
+    options: Optional[List[str]] = Field(default=None, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def title_not_blank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Введіть питання")
+        return v
+
+    @field_validator("options")
+    @classmethod
+    def clean_options(cls, v):
+        cleaned = [o.strip() for o in (v or []) if o and o.strip()]
+        # Голоси рейтингового опитування зберігаються рядком через кому
+        if any("," in o for o in cleaned):
+            raise ValueError("Варіант не може містити кому")
+        if any(len(o) > 200 for o in cleaned):
+            raise ValueError("Варіант задовгий (максимум 200 символів)")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("Варіанти не повинні повторюватися")
+        return cleaned
+
+    @model_validator(mode="after")
+    def options_match_type(self):
+        if self.pollType == "ranking" and not self.options:
+            raise ValueError("Рейтингове голосування потребує хоча б 1 варіанту")
+        if self.pollType == "standard":
+            self.options = []
+        return self
 
 def verify_admin(authorization: str = Header(None)):
-    if authorization != f"Bearer {ADMIN_PASSWORD}":
+    expected = f"Bearer {ADMIN_PASSWORD}".encode()
+    if not authorization or not secrets.compare_digest(authorization.encode(), expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Невірний пароль адміністратора",
         )
+
+def parse_options(raw):
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    return raw or []
+
+def poll_from_row(row):
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "pollType": row["poll_type"],
+        "options": parse_options(row["options"]),
+        "createdAt": row["created_at"].isoformat(),
+    }
+
+def public_mem_poll(p):
+    return {
+        "id": p["id"],
+        "title": p["title"],
+        "pollType": p.get("pollType", "standard"),
+        "options": p.get("options", []),
+        "createdAt": p.get("createdAt"),
+    }
+
+async def fetch_active_poll(conn):
+    row = await conn.fetchrow(
+        "SELECT id, title, poll_type, options, created_at FROM polls WHERE is_active ORDER BY created_at DESC LIMIT 1"
+    )
+    return poll_from_row(row) if row else None
+
+def invalidate_active_poll_cache():
+    active_poll_cache["expires"] = 0.0
+    active_poll_cache["generation"] += 1
+
+async def get_cached_active_poll():
+    if time.monotonic() < active_poll_cache["expires"]:
+        return active_poll_cache["poll"]
+    # Лише один запит на воркер іде в БД після закінчення TTL, решта чекають його результат
+    async with active_poll_lock:
+        if time.monotonic() < active_poll_cache["expires"]:
+            return active_poll_cache["poll"]
+        generation = active_poll_cache["generation"]
+        async with db_pool.acquire() as conn:
+            poll = await fetch_active_poll(conn)
+        # Якщо поки ми читали, опитування змінилося — не кешуємо можливо застарілий результат
+        if generation == active_poll_cache["generation"]:
+            active_poll_cache["poll"] = poll
+            active_poll_cache["expires"] = time.monotonic() + ACTIVE_POLL_CACHE_TTL
+        return poll
+
+def build_choice_text(poll_type, options, req: VoteRequest):
+    if poll_type == "standard":
+        if not req.choice:
+            raise HTTPException(status_code=400, detail="Не вибрано жодного варіанту!")
+        if req.choice not in STANDARD_CHOICES:
+            raise HTTPException(status_code=400, detail="Недопустимий варіант вибору")
+        return req.choice
+
+    selected = req.selectedOptions or []
+    if not selected:
+        raise HTTPException(status_code=400, detail="Не вибрано жодного варіанту!")
+    if len(set(selected)) != len(selected) or any(s not in options for s in selected):
+        raise HTTPException(status_code=400, detail="Недопустимий варіант вибору")
+    # Список обраних кандидатів через кому, у порядку опитування
+    return ", ".join(o for o in options if o in selected)
+
+def compute_stats(poll_type, options, choices):
+    if poll_type == "standard":
+        stats = {c: 0 for c in STANDARD_CHOICES}
+        for c in choices:
+            if c in stats:
+                stats[c] += 1
+        return stats
+
+    # Для рейтингового — ініціалізуємо всі опції нулями
+    stats = {opt: 0 for opt in options}
+    for c in choices:
+        for item in (s.strip() for s in c.split(",")):
+            if item:
+                stats[item] = stats.get(item, 0) + 1
+    return stats
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
@@ -113,15 +237,15 @@ async def serve_index():
     .top-bar { width: 100%; max-width: 800px; display: flex; justify-content: flex-end; margin-bottom: 10px; }
     .btn-admin-toggle { background: #cbd5e1; color: #334155; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: 0.2s; }
     .btn-admin-toggle:hover { background: #94a3b8; color: white; }
-    
+
     .card { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); width: 100%; max-width: 460px; text-align: center; box-sizing: border-box; margin-bottom: 20px; }
     h2 { margin-top: 0; color: #1e293b; }
     .poll-title { font-size: 1.25rem; font-weight: 700; color: #0284c7; margin: 15px 0 10px 0; }
     .poll-badge { display: inline-block; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; padding: 4px 8px; border-radius: 4px; background: #e0f2fe; color: #0369a1; margin-bottom: 15px; }
-    
+
     input[type="number"], input[type="text"], input[type="password"], textarea, select { width: 100%; padding: 12px; font-size: 1rem; border: 2px solid #cbd5e1; border-radius: 10px; box-sizing: border-box; margin-bottom: 15px; outline: none; }
     input:focus, textarea:focus, select:focus { border-color: #0284c7; }
-    
+
     .btn-group { display: flex; flex-direction: column; gap: 10px; }
     button.vote-btn { padding: 14px; font-size: 1.05rem; font-weight: bold; border: none; border-radius: 10px; cursor: pointer; color: white; transition: 0.15s; }
     button.vote-btn:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -177,7 +301,7 @@ async def serve_index():
     <div id="pollArea" style="display: none;">
       <div id="pollTypeBadge" class="poll-badge"></div>
       <div class="poll-title" id="pollQuestion">Завантаження...</div>
-      
+
       <input type="number" id="voterNumber" placeholder="Введіть ваш порядковий номер" min="1" style="text-align: center;">
 
       <!-- Варіант для стандартного опитування (За / Проти / Утримався) -->
@@ -249,60 +373,119 @@ async def serve_index():
     let currentPollId = null;
     let currentPollType = 'standard';
     let activePollId = null;
-    let adminToken = localStorage.getItem('voting_admin_pass') || '';
+    // Пароль живе лише до закриття вкладки; прибираємо копію, яку зберігали старі версії
+    try { localStorage.removeItem('voting_admin_pass'); } catch (e) {}
+    let adminToken = sessionStorage.getItem('voting_admin_pass') || '';
+
+    // Опитування, які цей браузер бачив закритими/заміненими. Інший воркер сервера ще кілька секунд
+    // може віддавати застарілу відповідь — не показуємо таке опитування повторно.
+    const closedPollIds = new Set();
+    let pollRequestSeq = 0;
+    let appliedPollSeq = 0;
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[ch]);
+    }
+
+    function errorText(data, fallback) {
+      const detail = data && data.detail;
+      if (Array.isArray(detail)) return detail.map(d => String(d.msg || '').replace('Value error, ', '')).join('; ');
+      return detail || fallback;
+    }
+
+    function getVotedPolls() {
+      try { return JSON.parse(localStorage.getItem('voting_voted_polls') || '[]'); } catch (e) { return []; }
+    }
+
+    function markVoted(pollId) {
+      try {
+        const voted = getVotedPolls();
+        if (!voted.includes(pollId)) {
+          voted.push(pollId);
+          localStorage.setItem('voting_voted_polls', JSON.stringify(voted.slice(-50)));
+        }
+      } catch (e) {}
+    }
 
     function toggleOptionsInput() {
       const type = document.getElementById('newPollType').value;
       document.getElementById('rankingInputArea').style.display = type === 'ranking' ? 'block' : 'none';
     }
 
+    function setVotingDisabled(disabled) {
+      document.getElementById('voterNumber').disabled = disabled;
+      document.querySelectorAll('.vote-btn').forEach(b => b.disabled = disabled);
+      document.querySelectorAll('input[name="rankChoice"]').forEach(c => c.disabled = disabled);
+    }
+
+    function renderPoll(poll) {
+      currentPollId = poll.id;
+      currentPollType = poll.pollType || 'standard';
+
+      document.getElementById('pollQuestion').innerText = poll.title;
+      document.getElementById('voterNumber').value = '';
+      document.getElementById('feedback').style.display = 'none';
+
+      const badge = document.getElementById('pollTypeBadge');
+      const stdButtons = document.getElementById('standardVoteButtons');
+      const rankArea = document.getElementById('rankingVoteArea');
+
+      if (currentPollType === 'ranking') {
+        badge.innerText = 'Рейтингове голосування';
+        stdButtons.style.display = 'none';
+        rankArea.style.display = 'block';
+
+        const list = document.getElementById('rankingOptionsList');
+        list.innerHTML = '';
+        (poll.options || []).forEach(opt => {
+          const label = document.createElement('label');
+          label.className = 'ranking-item';
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.name = 'rankChoice';
+          checkbox.value = opt;
+          const text = document.createElement('span');
+          text.textContent = opt;
+          label.append(checkbox, text);
+          list.appendChild(label);
+        });
+      } else {
+        badge.innerText = 'Звичайне голосування';
+        stdButtons.style.display = 'flex';
+        rankArea.style.display = 'none';
+      }
+
+      const alreadyVoted = getVotedPolls().includes(poll.id);
+      setVotingDisabled(alreadyVoted);
+      if (alreadyVoted) showMsg('Ваш вибір уже зараховано!', 'success');
+    }
+
     // Перевірка активного опитування для учасників
     async function checkPoll() {
+      const seq = ++pollRequestSeq;
       try {
-        const res = await fetch('/api/poll/active');
+        const res = await fetch('/api/poll/active', { cache: 'no-store' });
+        if (!res.ok) return;
         const data = await res.json();
+        // Відповідь на старіший запит прийшла пізніше за новіший — ігноруємо
+        if (seq < appliedPollSeq) return;
+        appliedPollSeq = seq;
+
         const noPoll = document.getElementById('noPoll');
         const pollArea = document.getElementById('pollArea');
+        const poll = data.active && !closedPollIds.has(data.poll.id) ? data.poll : null;
 
-        if (data.active) {
-          if (currentPollId !== data.poll.id) {
-            currentPollId = data.poll.id;
-            currentPollType = data.poll.pollType || 'standard';
-            
-            document.getElementById('pollQuestion').innerText = data.poll.title;
-            document.getElementById('voterNumber').disabled = false;
-            document.getElementById('voterNumber').value = '';
-            document.getElementById('feedback').style.display = 'none';
-
-            const badge = document.getElementById('pollTypeBadge');
-            const stdButtons = document.getElementById('standardVoteButtons');
-            const rankArea = document.getElementById('rankingVoteArea');
-
-            if (currentPollType === 'ranking') {
-              badge.innerText = 'Рейтингове голосування';
-              stdButtons.style.display = 'none';
-              rankArea.style.display = 'block';
-
-              const list = document.getElementById('rankingOptionsList');
-              list.innerHTML = '';
-              (data.poll.options || []).forEach((opt, idx) => {
-                list.innerHTML += `
-                  <label class="ranking-item">
-                    <input type="checkbox" name="rankChoice" value="${opt}">
-                    <span>${opt}</span>
-                  </label>
-                `;
-              });
-            } else {
-              badge.innerText = 'Звичайне голосування';
-              stdButtons.style.display = 'flex';
-              rankArea.style.display = 'none';
-              document.querySelectorAll('.vote-btn').forEach(b => b.disabled = false);
-            }
+        if (poll) {
+          if (currentPollId !== poll.id) {
+            if (currentPollId) closedPollIds.add(currentPollId);
+            renderPoll(poll);
           }
           noPoll.style.display = 'none';
           pollArea.style.display = 'block';
         } else {
+          if (currentPollId) closedPollIds.add(currentPollId);
           currentPollId = null;
           noPoll.style.display = 'block';
           pollArea.style.display = 'none';
@@ -356,12 +539,14 @@ async def serve_index():
         });
         const data = await res.json();
         if (res.ok) {
+          markVoted(payload.pollId);
           showMsg('Ваш вибір успішно зараховано!', 'success');
-          document.getElementById('voterNumber').disabled = true;
-          document.querySelectorAll('input[name="rankChoice"]').forEach(c => c.disabled = true);
+          setVotingDisabled(true);
         } else {
-          showMsg(data.detail || 'Помилка при збереженні голосу', 'error');
+          showMsg(errorText(data, 'Помилка при збереженні голосу'), 'error');
           if (onError) onError();
+          // Опитування могло закритися — оновлюємо стан одразу, не чекаючи таймера
+          if (res.status === 400) checkPoll();
         }
       } catch (err) {
         showMsg("Помилка з'єднання із сервером", 'error');
@@ -394,7 +579,7 @@ async def serve_index():
 
     function logoutAdmin() {
       adminToken = '';
-      localStorage.removeItem('voting_admin_pass');
+      sessionStorage.removeItem('voting_admin_pass');
       document.getElementById('adminPanel').style.display = 'none';
     }
 
@@ -402,21 +587,25 @@ async def serve_index():
       return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken };
     }
 
+    let adminLoading = false;
+
     async function loadAdminData(initial = false) {
-      if (!adminToken) return;
+      if (!adminToken || adminLoading) return;
+      adminLoading = true;
 
       try {
-        const res = await fetch('/api/admin/stats', { headers: getAdminHeaders() });
+        const res = await fetch('/api/admin/stats', { headers: getAdminHeaders(), cache: 'no-store' });
         if (res.status === 401) {
           if (initial) alert('Невірний пароль!');
           adminToken = '';
-          localStorage.removeItem('voting_admin_pass');
+          sessionStorage.removeItem('voting_admin_pass');
           document.getElementById('adminPanel').style.display = 'none';
           return;
         }
+        if (!res.ok) return;
 
         if (initial) {
-          localStorage.setItem('voting_admin_pass', adminToken);
+          sessionStorage.setItem('voting_admin_pass', adminToken);
           document.getElementById('adminPanel').style.display = 'block';
         }
 
@@ -427,38 +616,35 @@ async def serve_index():
           document.getElementById('pollStatus').innerText = data.poll.isActive ? '🟢 Голосування триває' : '🔴 Голосування закрито';
           document.getElementById('totalVotes').innerText = data.totalVotes;
 
-          const statsBox = document.getElementById('adminStatsBox');
-          statsBox.innerHTML = '';
+          let statsHtml = '';
           for (const [key, count] of Object.entries(data.stats)) {
             let colorClass = 'stat-rank';
             if (key === 'За') colorClass = 'stat-yes';
             if (key === 'Проти') colorClass = 'stat-no';
             if (key === 'Утримався') colorClass = 'stat-abstain';
 
-            statsBox.innerHTML += `
+            statsHtml += `
               <div class="stat-item ${colorClass}">
-                <div style="font-size: 0.85rem;">${key}</div>
-                <div class="stat-number">${count}</div>
+                <div style="font-size: 0.85rem;">${escapeHtml(key)}</div>
+                <div class="stat-number">${escapeHtml(count)}</div>
               </div>
             `;
           }
+          document.getElementById('adminStatsBox').innerHTML = statsHtml;
 
-          const table = document.getElementById('votersTable');
-          table.innerHTML = '';
-          data.votersList.forEach(v => {
-            table.innerHTML += `<tr><td>№ ${v.voterNumber}</td><td><b>${v.choice}</b></td></tr>`;
-          });
+          document.getElementById('votersTable').innerHTML = data.votersList
+            .map(v => `<tr><td>№ ${escapeHtml(v.voterNumber)}</td><td><b>${escapeHtml(v.choice)}</b></td></tr>`)
+            .join('');
         }
 
-        const resHist = await fetch('/api/admin/history', { headers: getAdminHeaders() });
+        const resHist = await fetch('/api/admin/history', { headers: getAdminHeaders(), cache: 'no-store' });
         if (resHist.ok) {
           const list = await resHist.json();
           const historyContainer = document.getElementById('historyList');
           if (!list || list.length === 0) {
             historyContainer.innerText = 'Історія опитувань порожня.';
           } else {
-            historyContainer.innerHTML = '';
-            list.forEach(item => {
+            historyContainer.innerHTML = list.map(item => {
               const statusText = item.isActive ? '<span style="color: green;">(Активне)</span>' : '<span style="color: gray;">(Завершено)</span>';
               let badgesHtml = '';
               for (const [name, cnt] of Object.entries(item.stats)) {
@@ -466,24 +652,26 @@ async def serve_index():
                 if (name === 'За') badgeClass = 'badge-yes';
                 if (name === 'Проти') badgeClass = 'badge-no';
                 if (name === 'Утримався') badgeClass = 'badge-abs';
-                badgesHtml += `<span class="badge ${badgeClass}">${name}: ${cnt}</span>`;
+                badgesHtml += `<span class="badge ${badgeClass}">${escapeHtml(name)}: ${escapeHtml(cnt)}</span>`;
               }
 
-              historyContainer.innerHTML += `
+              return `
                 <div class="history-card">
-                  <div><strong>${item.title}</strong> ${statusText}</div>
-                  <div style="font-size: 0.8rem; color: #64748b; margin-top: 2px;">Тип: ${item.pollType === 'ranking' ? 'Рейтингове' : 'Звичайне'} | Створено: ${new Date(item.createdAt).toLocaleString('uk-UA')}</div>
+                  <div><strong>${escapeHtml(item.title)}</strong> ${statusText}</div>
+                  <div style="font-size: 0.8rem; color: #64748b; margin-top: 2px;">Тип: ${item.pollType === 'ranking' ? 'Рейтингове' : 'Звичайне'} | Створено: ${escapeHtml(new Date(item.createdAt).toLocaleString('uk-UA'))}</div>
                   <div class="history-badges">
                     ${badgesHtml}
-                    <span style="font-size: 0.85rem; margin-left: auto; color: #334155;">Всього: ${item.totalVotes}</span>
+                    <span style="font-size: 0.85rem; margin-left: auto; color: #334155;">Всього: ${escapeHtml(item.totalVotes)}</span>
                   </div>
                 </div>
               `;
-            });
+            }).join('');
           }
         }
       } catch (err) {
         console.error(err);
+      } finally {
+        adminLoading = false;
       }
     }
 
@@ -499,30 +687,44 @@ async def serve_index():
         if (options.length === 0) return alert('Введіть хоча б 1 варіант вибору!');
       }
 
-      const res = await fetch('/api/admin/polls', {
-        method: 'POST',
-        headers: getAdminHeaders(),
-        body: JSON.stringify({ title, pollType, options })
-      });
-      if (res.ok) {
-        document.getElementById('newQuestion').value = '';
-        document.getElementById('rankingOptionsText').value = '';
-        alert('Голосування розпочато!');
-        loadAdminData();
-        checkPoll();
+      try {
+        const res = await fetch('/api/admin/polls', {
+          method: 'POST',
+          headers: getAdminHeaders(),
+          body: JSON.stringify({ title, pollType, options })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          document.getElementById('newQuestion').value = '';
+          document.getElementById('rankingOptionsText').value = '';
+          alert('Голосування розпочато!');
+          loadAdminData();
+          checkPoll();
+        } else {
+          alert('Помилка: ' + errorText(data, 'HTTP ' + res.status));
+        }
+      } catch (err) {
+        alert("Помилка з'єднання із сервером");
       }
     }
 
     async function closePoll() {
       if (!activePollId) return alert('Немає активного опитування');
-      const res = await fetch(`/api/admin/polls/${activePollId}/close`, {
-        method: 'POST',
-        headers: getAdminHeaders()
-      });
-      if (res.ok) {
-        alert('Голосування закрито!');
-        loadAdminData();
-        checkPoll();
+      try {
+        const res = await fetch(`/api/admin/polls/${encodeURIComponent(activePollId)}/close`, {
+          method: 'POST',
+          headers: getAdminHeaders()
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          alert('Голосування закрито!');
+          loadAdminData();
+          checkPoll();
+        } else {
+          alert('Помилка: ' + errorText(data, 'HTTP ' + res.status));
+        }
+      } catch (err) {
+        alert("Помилка з'єднання із сервером");
       }
     }
 
@@ -550,77 +752,55 @@ async def serve_index():
 """
 
 @app.get("/api/poll/active")
-async def get_active_poll():
-    global cached_active_poll
-    if cached_active_poll:
-        return {"active": True, "poll": cached_active_poll}
-
+async def get_active_poll(response: Response):
+    response.headers["Cache-Control"] = "no-store"
     if db_pool:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id, title, poll_type, options FROM polls WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 1"
-            )
-            if not row:
-                return {"active": False}
-            opts = json.loads(row["options"]) if isinstance(row["options"], str) else (row["options"] or [])
-            cached_active_poll = {
-                "id": row["id"],
-                "title": row["title"],
-                "pollType": row["poll_type"],
-                "options": opts
-            }
-            return {"active": True, "poll": cached_active_poll}
+        poll = await get_cached_active_poll()
     else:
-        active = [p for p in mem_polls if p.get("isActive")]
-        if not active:
-            return {"active": False}
-        p = active[-1]
-        return {
-            "active": True,
-            "poll": {
-                "id": p["id"],
-                "title": p["title"],
-                "pollType": p.get("pollType", "standard"),
-                "options": p.get("options", [])
-            }
-        }
+        poll = next((public_mem_poll(p) for p in reversed(mem_polls) if p.get("isActive")), None)
+
+    if not poll:
+        return {"active": False}
+    return {"active": True, "poll": poll}
 
 @app.post("/api/vote")
 async def cast_vote(req: VoteRequest):
     now = datetime.now(timezone.utc)
-    
-    # Визначаємо текст голосу: одиночний вибір або список обраних кандидатів через кому
-    if req.selectedOptions:
-        choice_text = ", ".join(req.selectedOptions)
-    elif req.choice:
-        choice_text = req.choice
-    else:
-        raise HTTPException(status_code=400, detail="Не вибрано жодного варіанту!")
+    vote_id = f"{req.pollId}_{req.voterNumber}"
 
     if db_pool:
         async with db_pool.acquire() as conn:
-            poll = await conn.fetchrow("SELECT is_active FROM polls WHERE id = $1", req.pollId)
+            poll = await conn.fetchrow("SELECT poll_type, options, is_active FROM polls WHERE id = $1", req.pollId)
             if not poll or not poll["is_active"]:
                 raise HTTPException(status_code=400, detail="Це голосування закрито")
+            choice_text = build_choice_text(poll["poll_type"], parse_options(poll["options"]), req)
 
-            vote_id = f"{req.pollId}_{req.voterNumber}"
             try:
-                await conn.execute(
-                    "INSERT INTO votes (id, poll_id, voter_number, choice, created_at) VALUES ($1, $2, $3, $4, $5)",
+                # Повторна перевірка активності в тому ж запиті — щоб голос не потрапив у щойно закрите опитування
+                inserted = await conn.fetchval(
+                    """
+                    INSERT INTO votes (id, poll_id, voter_number, choice, created_at)
+                    SELECT $1, $2, $3, $4, $5
+                    WHERE EXISTS (SELECT 1 FROM polls WHERE id = $2 AND is_active)
+                    RETURNING 1
+                    """,
                     vote_id, req.pollId, req.voterNumber, choice_text, now
                 )
             except asyncpg.UniqueViolationError:
                 raise HTTPException(status_code=409, detail=f"Номер {req.voterNumber} вже проголосував!")
+            if not inserted:
+                raise HTTPException(status_code=400, detail="Це голосування закрито")
     else:
         poll = next((p for p in mem_polls if p["id"] == req.pollId), None)
         if not poll or not poll.get("isActive"):
             raise HTTPException(status_code=400, detail="Це голосування закрито")
+        choice_text = build_choice_text(poll.get("pollType", "standard"), poll.get("options", []), req)
 
         if any(v["pollId"] == req.pollId and v["voterNumber"] == req.voterNumber for v in mem_votes):
             raise HTTPException(status_code=409, detail=f"Номер {req.voterNumber} вже проголосував!")
 
         mem_votes.append({
-            "id": f"{req.pollId}_{req.voterNumber}",
+            "id": vote_id,
             "pollId": req.pollId,
             "voterNumber": req.voterNumber,
             "choice": choice_text,
@@ -631,56 +811,52 @@ async def cast_vote(req: VoteRequest):
 
 @app.post("/api/admin/polls")
 async def create_poll(req: CreatePollRequest, authorization: str = Header(None)):
-    global cached_active_poll
     verify_admin(authorization)
     now = datetime.now(timezone.utc)
-    new_id = str(int(time.time()))
-
-    cached_active_poll = {
-        "id": new_id,
+    poll = {
+        "id": uuid.uuid4().hex,
         "title": req.title,
         "pollType": req.pollType,
-        "options": req.options
+        "options": req.options,
+        "createdAt": now.isoformat(),
     }
 
     if db_pool:
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE polls SET is_active = FALSE WHERE is_active = TRUE")
-            await conn.execute(
-                "INSERT INTO polls (id, title, poll_type, options, is_active, created_at) VALUES ($1, $2, $3, $4, TRUE, $5)",
-                new_id, req.title, req.pollType, json.dumps(req.options), now
-            )
+            async with conn.transaction():
+                # Серіалізуємо одночасні створення, щоб UPDATE бачив опитування, щойно створене іншим запитом
+                await conn.execute("SELECT pg_advisory_xact_lock(724502)")
+                await conn.execute("UPDATE polls SET is_active = FALSE WHERE is_active")
+                await conn.execute(
+                    "INSERT INTO polls (id, title, poll_type, options, is_active, created_at) VALUES ($1, $2, $3, $4, TRUE, $5)",
+                    poll["id"], req.title, req.pollType, json.dumps(req.options), now
+                )
+        invalidate_active_poll_cache()
     else:
         for p in mem_polls:
             p["isActive"] = False
-        mem_polls.append({
-            "id": new_id,
-            "title": req.title,
-            "pollType": req.pollType,
-            "options": req.options,
-            "isActive": True,
-            "createdAt": now.isoformat()
-        })
+        mem_polls.append({**poll, "isActive": True})
 
-    return {"success": True, "poll": cached_active_poll}
+    logger.info("Запущено голосування %s: %s", poll["id"], req.title)
+    return {"success": True, "poll": poll}
 
 @app.post("/api/admin/polls/{poll_id}/close")
 async def close_poll(poll_id: str, authorization: str = Header(None)):
-    global cached_active_poll
     verify_admin(authorization)
-    cached_active_poll = None
 
     if db_pool:
         async with db_pool.acquire() as conn:
             res = await conn.execute("UPDATE polls SET is_active = FALSE WHERE id = $1", poll_id)
-            if res == "UPDATE 0":
-                raise HTTPException(status_code=404, detail="Опитування не знайдено")
+        if res == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Опитування не знайдено")
+        invalidate_active_poll_cache()
     else:
         poll = next((p for p in mem_polls if p["id"] == poll_id), None)
         if not poll:
             raise HTTPException(status_code=404, detail="Опитування не знайдено")
         poll["isActive"] = False
 
+    logger.info("Закрито голосування %s", poll_id)
     return {"success": True, "message": "Голосування закрито"}
 
 @app.get("/api/admin/stats")
@@ -689,19 +865,11 @@ async def get_stats(authorization: str = Header(None)):
     if db_pool:
         async with db_pool.acquire() as conn:
             poll_row = await conn.fetchrow(
-                "SELECT id, title, poll_type, options, is_active FROM polls ORDER BY created_at DESC LIMIT 1"
+                "SELECT id, title, poll_type, options, is_active, created_at FROM polls ORDER BY created_at DESC LIMIT 1"
             )
             if not poll_row:
                 return {"poll": None}
-            
-            opts = json.loads(poll_row["options"]) if isinstance(poll_row["options"], str) else (poll_row["options"] or [])
-            current_poll = {
-                "id": poll_row["id"],
-                "title": poll_row["title"],
-                "pollType": poll_row["poll_type"],
-                "options": opts,
-                "isActive": poll_row["is_active"]
-            }
+            current_poll = {**poll_from_row(poll_row), "isActive": poll_row["is_active"]}
 
             vote_rows = await conn.fetch(
                 "SELECT voter_number, choice FROM votes WHERE poll_id = $1 ORDER BY voter_number ASC",
@@ -712,39 +880,16 @@ async def get_stats(authorization: str = Header(None)):
         if not mem_polls:
             return {"poll": None}
         p = mem_polls[-1]
-        current_poll = {
-            "id": p["id"],
-            "title": p["title"],
-            "pollType": p.get("pollType", "standard"),
-            "options": p.get("options", []),
-            "isActive": p.get("isActive", False)
-        }
+        current_poll = {**public_mem_poll(p), "isActive": p.get("isActive", False)}
         votes = [
             {"voterNumber": v["voterNumber"], "choice": v["choice"]}
             for v in mem_votes if v["pollId"] == current_poll["id"]
         ]
 
-    # Підрахунок статистики
-    stats = {}
-    if current_poll["pollType"] == "standard":
-        stats = {"За": 0, "Проти": 0, "Утримався": 0}
-        for v in votes:
-            c = v.get("choice")
-            if c in stats:
-                stats[c] += 1
-    else:
-        # Для рейтингового — ініціалізуємо всі опції нулями
-        for opt in current_poll["options"]:
-            stats[opt] = 0
-        for v in votes:
-            selected = [s.strip() for s in v["choice"].split(",") if s.strip()]
-            for item in selected:
-                stats[item] = stats.get(item, 0) + 1
-
     return {
         "poll": current_poll,
         "totalVotes": len(votes),
-        "stats": stats,
+        "stats": compute_stats(current_poll["pollType"], current_poll["options"], [v["choice"] for v in votes]),
         "votersList": sorted(votes, key=lambda x: x["voterNumber"]),
     }
 
@@ -755,63 +900,39 @@ async def get_history(authorization: str = Header(None)):
 
     if db_pool:
         async with db_pool.acquire() as conn:
-            polls = await conn.fetch("SELECT id, title, poll_type, options, is_active, created_at FROM polls ORDER BY created_at DESC")
-            for p in polls:
-                opts = json.loads(p["options"]) if isinstance(p["options"], str) else (p["options"] or [])
-                vote_rows = await conn.fetch("SELECT choice FROM votes WHERE poll_id = $1", p["id"])
-                
-                stats = {}
-                if p["poll_type"] == "standard":
-                    stats = {"За": 0, "Проти": 0, "Утримався": 0}
-                    for r in vote_rows:
-                        if r["choice"] in stats:
-                            stats[r["choice"]] += 1
-                else:
-                    for opt in opts:
-                        stats[opt] = 0
-                    for r in vote_rows:
-                        parts = [s.strip() for s in r["choice"].split(",") if s.strip()]
-                        for part in parts:
-                            stats[part] = stats.get(part, 0) + 1
-
-                history.append({
-                    "id": p["id"],
-                    "title": p["title"],
-                    "pollType": p["poll_type"],
-                    "isActive": p["is_active"],
-                    "createdAt": p["created_at"].isoformat(),
-                    "totalVotes": len(vote_rows),
-                    "stats": stats
-                })
+            polls = await conn.fetch("""
+                SELECT p.id, p.title, p.poll_type, p.options, p.is_active, p.created_at,
+                       COALESCE(array_agg(v.choice) FILTER (WHERE v.choice IS NOT NULL), '{}') AS choices
+                FROM polls p
+                LEFT JOIN votes v ON v.poll_id = p.id
+                GROUP BY p.id
+                ORDER BY p.created_at DESC
+            """)
+        for p in polls:
+            history.append({
+                "id": p["id"],
+                "title": p["title"],
+                "pollType": p["poll_type"],
+                "isActive": p["is_active"],
+                "createdAt": p["created_at"].isoformat(),
+                "totalVotes": len(p["choices"]),
+                "stats": compute_stats(p["poll_type"], parse_options(p["options"]), p["choices"])
+            })
     else:
         for p in reversed(mem_polls):
-            poll_votes = [v for v in mem_votes if v["pollId"] == p["id"]]
-            stats = {}
-            if p.get("pollType") == "standard":
-                stats = {"За": 0, "Проти": 0, "Утримався": 0}
-                for v in poll_votes:
-                    if v["choice"] in stats:
-                        stats[v["choice"]] += 1
-            else:
-                for opt in p.get("options", []):
-                    stats[opt] = 0
-                for v in poll_votes:
-                    parts = [s.strip() for s in v["choice"].split(",") if s.strip()]
-                    for part in parts:
-                        stats[part] = stats.get(part, 0) + 1
-
+            choices = [v["choice"] for v in mem_votes if v["pollId"] == p["id"]]
             history.append({
                 "id": p["id"],
                 "title": p["title"],
                 "pollType": p.get("pollType", "standard"),
                 "isActive": p.get("isActive", False),
                 "createdAt": p.get("createdAt"),
-                "totalVotes": len(poll_votes),
-                "stats": stats
+                "totalVotes": len(choices),
+                "stats": compute_stats(p.get("pollType", "standard"), p.get("options", []), choices)
             })
 
     return history
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
